@@ -168,6 +168,114 @@ fn impl_struct(input: Struct) -> TokenStream {
         }
     });
 
+    let variant_traits_impl = if let Some(source) = input.source_field() {
+        let trait_name = format_ident!("{}Throws", input.ident);
+        let method_name = {
+            let mut snake = String::new();
+            for (i, ch) in input.ident.to_string().char_indices() {
+                if i > 0 && ch.is_uppercase() {
+                    snake.push('_');
+                }
+                snake.push(ch.to_ascii_lowercase());
+            }
+            snake = snake.trim_end_matches("_error").to_owned();
+            snake
+        };
+        let throw_method = format_ident!("throw_{}", method_name);
+        let with_method = format_ident!("throw_{}_with", method_name);
+
+        let generics = {
+            use proc_macro2::{Ident, Span};
+
+            let mut generics = input.generics.clone();
+            generics.params.push(syn::GenericParam::Type(
+                Ident::new("__RETURN", Span::call_site()).into(),
+            ));
+            generics
+        };
+        let (thiserror_impl_generics, thiserror_ty_generics, _) = generics.split_for_impl();
+
+        let is_source = |field: &Field<'_>| {
+            if field.attrs.from.is_some() || field.attrs.source.is_some() {
+                return true;
+            }
+            match &field.member {
+                Member::Named(ident) if ident == "source" && source.member == field.member => true,
+                _ => false,
+            }
+        };
+
+        let (params, fields, types) = {
+            use syn::{punctuated::Punctuated, token::Comma, Ident};
+
+            let mut params = Punctuated::<TokenStream, Comma>::new();
+            let mut fields = Punctuated::<Ident, Comma>::new();
+            let mut types = Punctuated::<&Type, Comma>::new();
+
+            for (i, field) in input.fields.iter().filter(|f| !is_source(f)).enumerate() {
+                let field_ty = field.ty;
+
+                let field_name = if let Some(field_name) = field.original.ident.as_ref() {
+                    field_name.clone()
+                } else {
+                    format_ident!("_{}", i)
+                };
+
+                params.push(quote! {
+                    #field_name : #field_ty
+                });
+                fields.push(field_name);
+                types.push(field_ty);
+            }
+
+            (params, fields, types)
+        };
+
+        let source_ty = source.ty;
+
+        let new_struct = if let Some(source_field) = source.original.ident.as_ref() {
+            quote! {
+                #ty {
+                    #source_field : e,
+                    #fields
+                }
+            }
+        } else {
+            quote! {
+                #ty (e, #fields)
+            }
+        };
+
+        let with_method_decl = (!params.is_empty()).then(|| quote!{
+            fn #with_method<F: FnOnce() -> (#types)> (self, f: F) -> Result<__RETURN, #ty #ty_generics> #where_clause;
+        });
+        let with_method_impl = (!params.is_empty()).then(|| quote!{
+            fn #with_method<F: FnOnce() -> (#types)> (self, f: F) -> Result<__RETURN, #ty #ty_generics> #where_clause {
+                self.map_err(|e| {
+                    let (#fields) = f();
+                    #new_struct
+                })
+            }
+        });
+
+        Some(quote! {
+            trait #trait_name #thiserror_impl_generics {
+                fn #throw_method (self, #params) -> Result<__RETURN, #ty #ty_generics> #where_clause;
+                #with_method_decl
+            }
+            impl #thiserror_impl_generics #trait_name #thiserror_ty_generics for Result<__RETURN, #source_ty> #where_clause {
+                fn #throw_method (self, #params) -> Result<__RETURN, #ty #ty_generics> #where_clause {
+                    self.map_err(|e| {
+                        #new_struct
+                    })
+                }
+                #with_method_impl
+            }
+        })
+    } else {
+        None
+    };
+
     let error_trait = spanned_error_trait(input.original);
     if input.generics.type_params().next().is_some() {
         let self_token = <Token![Self]>::default();
@@ -184,6 +292,7 @@ fn impl_struct(input: Struct) -> TokenStream {
         }
         #display_impl
         #from_impl
+        #variant_traits_impl
     }
 }
 
@@ -433,6 +542,119 @@ fn impl_enum(input: Enum) -> TokenStream {
     }
     let error_where_clause = error_inferred_bounds.augment_where_clause(input.generics);
 
+    let variant_traits_impl: Vec<Option<TokenStream>> = {
+        let generics = {
+            use proc_macro2::{Ident, Span};
+
+            let mut generics = input.generics.clone();
+            generics.params.push(syn::GenericParam::Type(
+                Ident::new("__RETURN", Span::call_site()).into(),
+            ));
+            generics
+        };
+        let (thiserror_impl_generics, thiserror_ty_generics, _) = generics.split_for_impl();
+
+        input.variants.iter().map(|variant|{
+            if let Some(source) = variant.source_field() {
+                let variant_ident = &variant.ident;
+                let trait_name = format_ident!("{}{}Throws", input.ident, variant_ident);
+                let method_name = {
+                    let mut snake = String::new();
+                    for (i, ch) in variant_ident.to_string().char_indices() {
+                        if i > 0 && ch.is_uppercase() {
+                            snake.push('_');
+                        }
+                        snake.push(ch.to_ascii_lowercase());
+                    }
+                    snake = snake.trim_end_matches("_error").to_owned();
+                    snake
+                };
+                let throw_method = format_ident!("throw_{}", method_name);
+                let with_method = format_ident!("throw_{}_with", method_name);
+
+                let is_source = |field: &Field<'_>| {
+                    if field.attrs.from.is_some() || field.attrs.source.is_some() {
+                        return true;
+                    }
+                    match &field.member {
+                        Member::Named(ident) if ident == "source" && source.member == field.member => true,
+                        _ => false,
+                    }
+                };
+
+                let (params, fields, types) = {
+                    use syn::{punctuated::Punctuated, token::Comma, Ident};
+
+                    let mut params = Punctuated::<TokenStream, Comma>::new();
+                    let mut fields = Punctuated::<Ident, Comma>::new();
+                    let mut types = Punctuated::<&Type, Comma>::new();
+
+                    for (i, field) in variant.fields.iter().filter(|f| !is_source(f)).enumerate() {
+                        let field_ty = field.ty;
+
+                        let field_name = if let Some(field_name) = field.original.ident.as_ref() {
+                            field_name.clone()
+                        } else {
+                            format_ident!("_{}", i)
+                        };
+
+                        params.push(quote! {
+                            #field_name : #field_ty
+                        });
+                        fields.push(field_name);
+                        types.push(field_ty);
+                    }
+
+                    (params, fields, types)
+                };
+
+                let source_ty = source.ty;
+
+                let new_struct = if let Some(source_field) = source.original.ident.as_ref() {
+                    quote! {
+                        #ty :: #variant_ident {
+                            #source_field : e,
+                            #fields
+                        }
+                    }
+                } else {
+                    quote! {
+                        #ty :: #variant_ident (e, #fields)
+                    }
+                };
+
+                let with_method_decl = (!params.is_empty()).then(|| quote!{
+                    fn #with_method<F: FnOnce() -> (#types)> (self, f: F) -> Result<__RETURN, #ty #ty_generics> #where_clause;
+                });
+                let with_method_impl = (!params.is_empty()).then(|| quote!{
+                    fn #with_method<F: FnOnce() -> (#types)> (self, f: F) -> Result<__RETURN, #ty #ty_generics> #where_clause {
+                        self.map_err(|e| {
+                            let (#fields) = f();
+                            #new_struct
+                        })
+                    }
+                });
+
+                Some(quote! {
+                    trait #trait_name #thiserror_impl_generics {
+                        fn #throw_method (self, #params) -> Result<__RETURN, #ty #ty_generics> #where_clause;
+                        #with_method_decl
+                    }
+                    impl #thiserror_impl_generics #trait_name #thiserror_ty_generics for Result<__RETURN, #source_ty> #where_clause {
+                        fn #throw_method (self, #params) -> Result<__RETURN, #ty #ty_generics> #where_clause {
+                            self.map_err(|e| {
+                                #new_struct
+                            })
+                        }
+                        #with_method_impl
+                    }
+                })
+            } else {
+                None
+            }
+        }).collect()
+    };
+
     quote! {
         #[allow(unused_qualifications)]
         impl #impl_generics #error_trait for #ty #ty_generics #error_where_clause {
@@ -441,6 +663,7 @@ fn impl_enum(input: Enum) -> TokenStream {
         }
         #display_impl
         #(#from_impls)*
+        #(#variant_traits_impl)*
     }
 }
 
